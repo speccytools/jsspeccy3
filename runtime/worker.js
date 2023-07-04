@@ -134,6 +134,11 @@ const loadMemoryPage = (page, offset, data) => {
     memoryData.set(data, core.MACHINE_MEMORY + page * 0x1000 + offset);
 };
 
+const fetchMemoryPage = (page, offset, len) => {
+    const begin = core.MACHINE_MEMORY + page * 0x1000 + offset;
+    return memoryData.slice(begin, begin + len);
+};
+
 const loadSnapshot = (snapshot) => {
     core.setMachineType(snapshot.model);
     for (let page in snapshot.memoryPages) {
@@ -310,6 +315,14 @@ onmessage = (e) => {
             break;
         case 'loadMemory':
             loadMemoryPage(e.data.page, e.data.offset, e.data.data);
+            break;
+        case 'fetchMemory':
+            var result = fetchMemoryPage(e.data.page, e.data.offset, e.data.len);
+            postMessage({
+                message: 'memoryFetched',
+                data: result,
+                id: e.data.id
+            });
             break;
         case 'loadSnapshot':
             loadSnapshot(e.data.snapshot);

@@ -9,6 +9,7 @@ import { parseSNAFile, parseZ80File, parseSZXFile } from './snapshot.js';
 import { TAPFile, TZXFile } from './tape.js';
 import { KeyboardHandler } from './keyboard.js';
 import { AudioHandler } from './audio.js';
+import { SpectranetConfiguration, SpectranetConfigurationOption } from './spectranet.js';
 import { Long, serialize, deserialize } from 'bson';
 
 import openIcon from './icons/open.svg';
@@ -61,36 +62,13 @@ class Emulator extends EventEmitter {
 
         this.nextFileOpenID = 0;
         this.fileOpenPromiseResolutions = {};
+        this.nextMemoryFetchID = 0;
+        this.memoryFetchResolutions = {};
 
         this.worker.onmessage = (e) => {
             switch(e.data.message) {
                 case 'ready':
-                    this.loadRoms().then(() => {
-                        this.setMachine(opts.machine || 128);
-                        this.setTapeTraps(this.tapeTrapsEnabled);
-
-                        let hm = this.getCookie("hm");
-                        if (!hm) {
-                            hm = (Math.random() + 1).toString(36).substring(6);
-                            this.setCookie("hm", hm, 90);
-                        }
-                        this.setMAC(hm).then(() => {
-                            if (opts.tnfs) {
-                                this.loadTNFS(opts.tnfs).then(() => {
-                                    if (opts.autoStart) this.start();
-                                });
-                            } else if (opts.openUrl) {
-                                this.openUrlList(opts.openUrl).catch(err => {
-                                    alert(err);
-                                }).then(() => {
-                                    if (opts.autoStart) this.start();
-                                });
-                            } else if (opts.autoStart) {
-                                this.start();
-                            }
-                        });
-
-                    });
+                    this.ready(opts);
                     break;
                 case 'frameCompleted':
                     // benchmarkRunCount++;
@@ -112,6 +90,10 @@ class Emulator extends EventEmitter {
                     } else {
                         this.isExecutingFrame = false;
                     }
+                    break;
+                case 'memoryFetched':
+                    this.memoryFetchResolutions[e.data.id](e.data.data);
+                    delete this.memoryFetchResolutions[e.data.id];
                     break;
                 case 'fileOpened':
                     if (e.data.mediaType == 'tape' && this.autoLoadTapes) {
@@ -211,6 +193,34 @@ class Emulator extends EventEmitter {
         };
     }
 
+    async ready(opts) {
+        await this.loadRoms();
+        this.setMachine(opts.machine || 128);
+        this.setTapeTraps(this.tapeTrapsEnabled);
+
+        const configFlash = await this.fetchRomData(88 + 31, 0, 4096);
+        const config = new SpectranetConfiguration(configFlash);
+
+        if (opts.tnfs) {
+            await this.loadTNFS(opts.tnfs, config);
+        } else {
+            await this.unloadTNFS(config);
+
+            if (opts.openUrl) {
+                this.openUrlList(opts.openUrl).catch(err => {
+                    alert(err);
+                })
+            }
+        }
+
+        console.log("Spectranet config:");
+        console.log(config);
+
+        await this.loadRomData(config.bake(), 88 + 31, 0);
+
+        if (opts.autoStart) this.start();
+    }
+
     saveSpectranetRom() {
         if (this.spectranetRomSaveTimer !== -1) {
             clearTimeout(this.spectranetRomSaveTimer);
@@ -272,6 +282,21 @@ class Emulator extends EventEmitter {
         });
     }
 
+    fetchRomData(page, offset, len) {
+        const fetchID = this.nextMemoryFetchID++;
+        this.worker.postMessage({
+            message: 'fetchMemory',
+            page: page,
+            offset: offset,
+            len: len,
+            id: fetchID
+        });
+        const self = this;
+        return new Promise((resolve, reject) => {
+            self.memoryFetchResolutions[fetchID] = resolve;
+        });
+    }
+
     async loadRom(url, page, offset = 0) {
         const response = await fetch(new URL(url, scriptUrl));
         const data = new Uint8Array(await response.arrayBuffer());
@@ -293,24 +318,21 @@ class Emulator extends EventEmitter {
         }
     }
 
-    async setMAC(addr) {
-        const v = new Uint8Array(6);
-        for (let i = 0; i < 6; i++) {
-            v[i] = addr.charCodeAt(i);
+    async unloadTNFS(config) {
+        if (config.sections.hasOwnProperty(0x01ff)) {
+            // delete auto-mount section
+            delete config.sections[0x01ff];
         }
-        await this.loadRomData(v, 88 + 31, 3848);
     }
 
-    async loadTNFS(resource) {
+    async loadTNFS(resource, config) {
         console.log("Mounting TNFS to: " + resource);
-        const blob = new Uint8Array([0x1C, 0x00, 0xFF, 0x01, 0x16, 0x00, 0x81, 0x01, 0x00]);
-        await this.loadRomData(blob, 88 + 31, 0);
-        const v = new Uint8Array(resource.length + 1);
-        for (let i = 0; i < resource.length; i++) {
-            v[i] = resource.charCodeAt(i);
-        }
-        v[resource.length] = 0;
-        await this.loadRomData(v, 88 + 31, 9);
+
+        const autoMountConfig = config.obtainSection(0x01ff);
+
+        autoMountConfig[0x00] = new SpectranetConfigurationOption("string", resource);
+        // auto-boot
+        autoMountConfig[0x81] = new SpectranetConfigurationOption("byte", 1);
     }
 
     runFrame() {
